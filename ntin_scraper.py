@@ -1,18 +1,17 @@
 """ntin_scraper.py
 
 Usage:
-  python ntin_scraper.py [--headless] [--outdir=path]
+  python ntin_scraper.py [--headless] [--outdir=path] [--input=ACTIVE.xlsx]
 
-This script opens the provided site, logs in, enters each SKU from SKU_LIST,
-waits, clicks "Создать заявку", extracts structured field values from the modal,
-and saves everything into a single Excel file with one row per SKU.
-
-Selectors are pre-configured from user input. Adjust XPATHs below if needed.
+This script opens the provided site, logs in, loads SKU values from an Excel file,
+processes them sequentially, waits for the modal to fully load, extracts structured
+field values, and periodically saves progress so the run can be resumed after failure.
 """
 import time
 import re
 import sys
 import os
+import logging
 from pathlib import Path
 import argparse
 
@@ -28,20 +27,16 @@ import pandas as pd
 
 # ----- CONFIG (adjust if needed) -----
 URL = "https://app.algatop.kz/ntin"
+INPUT_FILE_NAME = "ACTIVE.xlsx"
+INPUT_SHEET_NAME = 0
+INPUT_SKU_COLUMN = "sku"
+OUTPUT_FILE_NAME = "output.xlsx"
+PROGRESS_FILE_NAME = "progress.xlsx"
+LOG_FILE_NAME = "scraper.log"
+CHECKPOINT_EVERY = 100
+OUTPUT_DIR = Path.cwd()
+WAIT_TIMEOUT = 20
 
-# LIST OF SKU TO PROCESS - add/remove/edit as needed
-SKU_LIST = [
-    "115050528_928421346",
-    "104841221_113781",
-    "189893632"
-
-    # Add more SKU here, one per line, like:
-    # "SKU_2",
-    # "SKU_3",
-]
-
-# User-provided selectors
-# Primary XPATH may be dynamic (contains colons). Use a list of candidates for robustness.
 SEARCH_XPATH = "//*[@id=':r5:']"
 SEARCH_CANDIDATES = [
     "//*[@id=':r5:']",
@@ -52,13 +47,9 @@ SEARCH_CANDIDATES = [
     "//input[@role='combobox']",
 ]
 CREATE_BUTTON_XPATH = "//*[@id='root']/div/div[3]/div/div[2]/div[2]/div[4]/div[2]/table/tbody/tr[1]/td[5]/div/span/button"
-# Кнопка "Перейти" - appears after login
 GO_BUTTON_XPATH = "//button[contains(., 'Перейти')]"
 MODAL_TITLE_TEXT = "Создание заявки"
 MODAL_FALLBACK_XPATH = "//div[@role='dialog'] | //div[contains(@class,'modal')] | //div[contains(@class,'MuiDialog-root')]"
-OUTPUT_FILE_NAME = "output.xlsx"
-OUTPUT_DIR = Path.cwd()
-WAIT_TIMEOUT = 20
 TABLE_COLUMNS = [
     "SKU",
     "NTIN_CODE",
@@ -74,8 +65,42 @@ TABLE_COLUMNS = [
     "Подобрано AI",
     "Расширенная форма заявки",
     "Raw Text",
+    "Status",
+    "Error",
+]
+REQUIRED_FIELDS = [
+    "Полное наименование товара (рус)",
+    "Полное наименование товара (каз)",
+    "Краткое наименование товара (рус)",
+    "Страна происхождения",
+    "Единица измерения",
+    "Количественное значение",
+    "ТНВЭД ЕАЭС",
+    "Наименование производителя",
 ]
 # --------------------------------------
+
+
+def setup_logging(outdir=OUTPUT_DIR):
+    outdir = Path(outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+    log_path = outdir / LOG_FILE_NAME
+
+    logger = logging.getLogger("ntin_scraper")
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+
+    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setFormatter(formatter)
+    logger.addHandler(stream_handler)
+
+    return logger
 
 
 def get_driver(headless=False):
@@ -88,10 +113,57 @@ def get_driver(headless=False):
     return webdriver.Chrome(service=service, options=options)
 
 
+def load_skus_from_excel(input_file, sku_column=INPUT_SKU_COLUMN, sheet_name=INPUT_SHEET_NAME):
+    df = pd.read_excel(input_file, sheet_name=sheet_name)
+    normalized_columns = {str(col).strip().lower(): col for col in df.columns}
+    target_col = normalized_columns.get(sku_column.strip().lower())
+    if not target_col:
+        raise ValueError(f"Column '{sku_column}' not found in {input_file}. Found columns: {list(df.columns)}")
+
+    series = df[target_col].dropna().astype(str).map(str.strip)
+    series = series[series != ""]
+    return series.tolist()
+
+
+def load_existing_progress(progress_file):
+    progress_path = Path(progress_file)
+    if not progress_path.exists():
+        return pd.DataFrame(columns=TABLE_COLUMNS)
+    try:
+        df = pd.read_excel(progress_path)
+        for col in TABLE_COLUMNS:
+            if col not in df.columns:
+                df[col] = ""
+        return df[TABLE_COLUMNS]
+    except Exception:
+        return pd.DataFrame(columns=TABLE_COLUMNS)
+
+
+def get_processed_skus(progress_df):
+    if progress_df.empty or "SKU" not in progress_df.columns:
+        return set()
+    return set(progress_df["SKU"].dropna().astype(str).str.strip())
+
+
+def save_checkpoint(rows, outdir=OUTPUT_DIR, filename=PROGRESS_FILE_NAME):
+    outdir = Path(outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+    out_file = outdir / filename
+    df = pd.DataFrame(rows, columns=TABLE_COLUMNS)
+    df.to_excel(out_file, index=False)
+    return out_file
+
+
+def save_results_to_excel(rows, outdir=OUTPUT_DIR, filename=OUTPUT_FILE_NAME):
+    outdir = Path(outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+    out_file = outdir / filename
+    df = pd.DataFrame(rows, columns=TABLE_COLUMNS)
+    df.to_excel(out_file, index=False)
+    return out_file
+
+
 def perform_login(driver, username, password, wait_timeout=20):
-    """Try several common selectors to locate login form, fill credentials and submit.
-    Returns True if login action likely performed, False otherwise.
-    """
     email_selectors = [
         (By.NAME, 'email'),
         (By.NAME, 'username'),
@@ -159,7 +231,6 @@ def perform_login(driver, username, password, wait_timeout=20):
 
 
 def click_go_button(driver, wait_timeout=20):
-    """Click the 'Перейти' button that appears after login."""
     try:
         btn = WebDriverWait(driver, wait_timeout).until(
             EC.element_to_be_clickable((By.XPATH, GO_BUTTON_XPATH))
@@ -173,7 +244,6 @@ def click_go_button(driver, wait_timeout=20):
 
 
 def close_modal_cancel(driver, wait_timeout=5):
-    """Close the open modal by clicking 'Отмена' button, or the close icon, or sending ESC."""
     candidates = [
         "//button[contains(., 'Отмена') or contains(., 'Отмен')]",
         "//button[@aria-label='close' or @aria-label='Close']",
@@ -214,14 +284,10 @@ def close_modal_cancel(driver, wait_timeout=5):
         time.sleep(0.5)
         return True
     except Exception:
-        print("Warning: could not close modal (no cancel/close found)")
         return False
 
 
 def clear_search_input(driver, wait_timeout=3):
-    """Attempt multiple ways to clear the search input or remove selected tokens.
-    Returns True if cleared or no input found, False otherwise.
-    """
     try:
         el = find_search_input(driver)
     except Exception:
@@ -336,76 +402,6 @@ def click_create_button(driver):
     raise last_exc
 
 
-def find_modal_text(driver):
-    try:
-        title_el = WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.XPATH, f"//*[contains(text(), '{MODAL_TITLE_TEXT}')]") )
-        )
-        ancestor = title_el.find_element(By.XPATH, "ancestor::div[@role='dialog'] | ancestor::div[contains(@class,'modal')] | ancestor::div[contains(@class,'MuiDialog-root')] | ..")
-        text = ancestor.text
-        if text.strip():
-            return text
-    except Exception:
-        pass
-
-    try:
-        modal = WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.XPATH, MODAL_FALLBACK_XPATH))
-        )
-        time.sleep(0.3)
-        return modal.text
-    except Exception:
-        pass
-
-    return driver.page_source
-
-
-def extract_from_1103(text):
-    m = re.search(r'(1103[-\d]+)', text)
-    if m:
-        return m.group(1)
-
-    lines = text.splitlines()
-    for line in lines:
-        stripped = line.strip()
-        if stripped.startswith("1103-"):
-            m = re.match(r'(1103[-\d]+)', stripped)
-            if m:
-                return m.group(1)
-    return None
-
-
-def save_results_to_excel(rows, outdir=OUTPUT_DIR, filename=OUTPUT_FILE_NAME):
-    outdir = Path(outdir)
-    outdir.mkdir(parents=True, exist_ok=True)
-    out_file = outdir / filename
-    df = pd.DataFrame(rows, columns=TABLE_COLUMNS)
-    df.to_excel(out_file, index=False)
-    return out_file
-
-
-def get_next_value(lines, index):
-    if index < len(lines):
-        line = lines[index]
-        parts = re.split(r"\s*[:\-]\s*", line, maxsplit=1)
-        if len(parts) == 2 and parts[0].strip() != line.strip():
-            return parts[1].strip()
-        if index + 1 < len(lines):
-            return lines[index + 1].strip()
-    return ""
-
-
-def find_label_value(lines, labels):
-    for i, line in enumerate(lines):
-        for label in labels:
-            if line.startswith(label):
-                value = line[len(label):].strip()
-                if value:
-                    return value
-                return get_next_value(lines, i + 1)
-    return ""
-
-
 def get_modal_container(driver):
     try:
         return WebDriverWait(driver, 10).until(
@@ -413,58 +409,6 @@ def get_modal_container(driver):
         )
     except Exception:
         return None
-
-
-def wait_for_modal_ready(driver, timeout=20):
-    """Wait until the modal is visible and key fields are populated."""
-    wait = WebDriverWait(driver, timeout)
-
-    wait.until(EC.visibility_of_element_located((By.XPATH, MODAL_FALLBACK_XPATH)))
-
-    def modal_is_ready(_driver):
-        try:
-            modal = get_modal_container(_driver)
-            if modal is None or not modal.is_displayed():
-                return False
-
-            text = (modal.text or "").strip()
-            if re.search(r'\d{4}-\d{4}-\d{4}-\d+', text):
-                return modal
-
-            candidate_xpaths = [
-                ".//input[string-length(@value) > 0]",
-                ".//textarea[string-length(@value) > 0]",
-                ".//div[@role='combobox' and string-length(normalize-space()) > 0]",
-                ".//input[@role='combobox' and string-length(@value) > 0]",
-                ".//input[@type='number' and string-length(@value) > 0]",
-            ]
-
-            for xp in candidate_xpaths:
-                try:
-                    elems = modal.find_elements(By.XPATH, xp)
-                    if elems:
-                        return modal
-                except Exception:
-                    continue
-
-            labels_to_check = [
-                "Полное наименование товара (рус)",
-                "Страна происхождения",
-                "Единица измерения",
-                "ТНВЭД ЕАЭС",
-                "Наименование производителя",
-            ]
-
-            for label in labels_to_check:
-                value = get_field_value_from_modal(modal, [label])
-                if value and value.strip():
-                    return modal
-
-            return False
-        except Exception:
-            return False
-
-    return wait.until(modal_is_ready)
 
 
 def extract_ntin_code(modal):
@@ -666,7 +610,6 @@ def extract_fields_from_modal(driver):
 
     row = {col: "" for col in TABLE_COLUMNS}
     row["Raw Text"] = text.strip()
-
     row["NTIN_CODE"] = extract_ntin_code(modal)
 
     row["Полное наименование товара (рус)"] = get_field_value_from_modal(modal, [
@@ -674,123 +617,57 @@ def extract_fields_from_modal(driver):
         "Полное наименование товара (рус) *",
         "Полное наименование товара (рус) **",
     ])
-
     row["Полное наименование товара (каз)"] = get_field_value_from_modal(modal, [
         "Полное наименование товара (каз)",
         "Полное наименование товара (каз) *",
         "Полное наименование товара (каз) **",
     ])
-
     row["Краткое наименование товара (рус)"] = get_field_value_from_modal(modal, [
         "Краткое наименование товара (рус)",
         "Краткое наименование товара (рус) *",
         "Краткое наименование товара (рус) **",
     ])
-
     row["Страна происхождения"] = get_field_value_from_modal(modal, [
         "Страна происхождения",
         "Страна происхождения *",
         "Страна происхождения **",
     ])
-
     row["Единица измерения"] = get_field_value_from_modal(modal, [
         "Единица измерения",
         "Единица измерения *",
         "Единица измерения **",
     ])
-
     row["Количественное значение"] = get_field_value_from_modal(modal, [
         "Количество количественное значение",
         "Количество количественное значение (в [ед. изм.])",
         "Количественное значение",
         "Количество значение",
     ])
-
     row["ТНВЭД ЕАЭС"] = get_field_value_from_modal(modal, [
         "ТНВЭД ЕАЭС",
         "ТНВЭД ЕАЭС *",
         "ТНВЭД ЕАЭС **",
     ])
-
     row["Наименование производителя"] = get_field_value_from_modal(modal, [
         "Наименование производителя",
         "Наименование производителя *",
         "Наименование производителя **",
     ])
-
     row["Категория ОКТРУ (НКТ)"] = get_field_value_from_modal(modal, [
         "Категория ОКТРУ (НКТ)",
         "Категория ОКТРУ (НКТ) *",
         "Категория ОКТРУ (НКТ) **",
     ])
-
     row["Подобрано AI"] = get_field_value_from_modal(modal, [
         "Подобрано AI",
         "Подобрано AI *",
         "Подобрано AI **",
     ])
-
     row["Расширенная форма заявки"] = get_field_value_from_modal(modal, [
         "Расширенная форма заявки",
         "Расширенная форма заявки *",
         "Расширенная форма заявки **",
     ])
-
-    if not row["Страна происхождения"] and modal:
-        try:
-            labels = modal.find_elements(By.XPATH, ".//label[contains(., 'Страна происхождения')]")
-            for lbl in labels:
-                label_for = lbl.get_attribute("for")
-                if label_for:
-                    el = modal.find_element(By.XPATH, f".//*[@id='{label_for}']")
-                    text = (el.text or "").strip()
-                    if text:
-                        row["Страна происхождения"] = text
-                        break
-        except Exception:
-            pass
-
-    if not row["Единица измерения"] and modal:
-        try:
-            labels = modal.find_elements(By.XPATH, ".//label[contains(., 'Единица измерения')]")
-            for lbl in labels:
-                label_for = lbl.get_attribute("for")
-                if label_for:
-                    el = modal.find_element(By.XPATH, f".//*[@id='{label_for}']")
-                    text = (el.text or "").strip()
-                    if text:
-                        row["Единица измерения"] = text
-                        break
-        except Exception:
-            pass
-
-    if not row["Количественное значение"] and modal:
-        try:
-            labels = modal.find_elements(By.XPATH, ".//label[contains(., 'Количественное значение') or contains(., 'Количество количественное значение')]")
-            for lbl in labels:
-                label_for = lbl.get_attribute("for")
-                if label_for:
-                    el = modal.find_element(By.XPATH, f".//*[@id='{label_for}']")
-                    value = el.get_attribute("value")
-                    if value and value.strip():
-                        row["Количественное значение"] = value.strip()
-                        break
-        except Exception:
-            pass
-
-    if not row["ТНВЭД ЕАЭС"] and modal:
-        try:
-            labels = modal.find_elements(By.XPATH, ".//label[contains(., 'ТНВЭД ЕАЭС')]")
-            for lbl in labels:
-                label_for = lbl.get_attribute("for")
-                if label_for:
-                    el = modal.find_element(By.XPATH, f".//*[@id='{label_for}']")
-                    value = el.get_attribute("value")
-                    if value and value.strip():
-                        row["ТНВЭД ЕАЭС"] = value.strip()
-                        break
-        except Exception:
-            pass
 
     if not row["Наименование производителя"] and modal:
         try:
@@ -809,8 +686,32 @@ def extract_fields_from_modal(driver):
     return row
 
 
-def process_single_sku(driver, sku, outdir=OUTPUT_DIR):
-    """Process a single SKU: input it, click button, extract data, return row dict."""
+def are_required_fields_loaded(row):
+    for field in REQUIRED_FIELDS:
+        value = row.get(field, "")
+        if not str(value).strip():
+            return False
+    return True
+
+
+def wait_for_modal_ready(driver, timeout=30):
+    wait = WebDriverWait(driver, timeout)
+    wait.until(EC.visibility_of_element_located((By.XPATH, MODAL_FALLBACK_XPATH)))
+
+    def modal_is_ready(_driver):
+        try:
+            modal = get_modal_container(_driver)
+            if modal is None or not modal.is_displayed():
+                return False
+            row = extract_fields_from_modal(_driver)
+            return modal if are_required_fields_loaded(row) else False
+        except Exception:
+            return False
+
+    return wait.until(modal_is_ready)
+
+
+def process_single_sku(driver, sku, logger, outdir=OUTPUT_DIR):
     try:
         try:
             clear_search_input(driver)
@@ -830,35 +731,77 @@ def process_single_sku(driver, sku, outdir=OUTPUT_DIR):
             pass
 
         click_create_button(driver)
-        wait_for_modal_ready(driver, timeout=25)
+        wait_for_modal_ready(driver, timeout=30)
 
         row = extract_fields_from_modal(driver)
         row["SKU"] = sku
+        row["Status"] = "success"
+        row["Error"] = ""
 
-        print(f"  [SKU: {sku}] Extracted row values")
+        logger.info(f"[SKU: {sku}] Extracted successfully")
         try:
             closed = close_modal_cancel(driver)
             if not closed:
-                print(f"  [SKU: {sku}] Warning: could not automatically close modal")
+                logger.warning(f"[SKU: {sku}] Could not automatically close modal")
         except Exception as e:
-            print(f"  [SKU: {sku}] Warning: error while closing modal: {e}")
+            logger.warning(f"[SKU: {sku}] Error while closing modal: {e}")
         return row
     except Exception as e:
-        print(f"  [SKU: {sku}] Error: {e}")
-        return None
+        logger.error(f"[SKU: {sku}] Error: {e}")
+        return {
+            "SKU": sku,
+            "NTIN_CODE": "",
+            "Полное наименование товара (рус)": "",
+            "Полное наименование товара (каз)": "",
+            "Краткое наименование товара (рус)": "",
+            "Страна происхождения": "",
+            "Единица измерения": "",
+            "Количественное значение": "",
+            "ТНВЭД ЕАЭС": "",
+            "Наименование производителя": "",
+            "Категория ОКТРУ (НКТ)": "",
+            "Подобрано AI": "",
+            "Расширенная форма заявки": "",
+            "Raw Text": "",
+            "Status": "error",
+            "Error": str(e),
+        }
 
 
-def main(sku=None, url=URL, headless=False, outdir=None, username=None, password=None, sku_list=None):
-    """Main function: login once, click 'Перейти', then process all SKUs from sku_list."""
+def main(sku=None, url=URL, headless=False, outdir=None, username=None, password=None,
+         sku_list=None, input_file=None, sku_column=INPUT_SKU_COLUMN):
+    outdir = Path(outdir or OUTPUT_DIR)
+    outdir.mkdir(parents=True, exist_ok=True)
+    logger = setup_logging(outdir)
+
+    input_path = Path(input_file or INPUT_FILE_NAME)
+    progress_path = outdir / PROGRESS_FILE_NAME
+
     if sku_list is None:
         if sku:
             sku_list = [sku]
         else:
-            sku_list = SKU_LIST
+            sku_list = load_skus_from_excel(input_path, sku_column=sku_column)
 
     if not sku_list:
-        print("Error: No SKU provided. Add SKU to SKU_LIST in config or pass --sku argument.")
+        logger.error("No SKU provided or found in input file.")
         return 1
+
+    existing_progress = load_existing_progress(progress_path)
+    rows = existing_progress.to_dict("records") if not existing_progress.empty else []
+    processed_skus = get_processed_skus(existing_progress)
+
+    pending_skus = [str(x).strip() for x in sku_list if str(x).strip() and str(x).strip() not in processed_skus]
+
+    logger.info(f"Loaded {len(sku_list)} SKU(s) from source")
+    logger.info(f"Already processed: {len(processed_skus)}")
+    logger.info(f"Pending: {len(pending_skus)}")
+
+    if not pending_skus:
+        logger.info("Nothing to process. All SKU values are already in progress file.")
+        final_file = save_results_to_excel(rows, outdir=outdir)
+        logger.info(f"Final file is up to date: {final_file}")
+        return 0
 
     driver = get_driver(headless=headless)
     try:
@@ -872,41 +815,50 @@ def main(sku=None, url=URL, headless=False, outdir=None, username=None, password
             user = username or os.environ.get('ALGATOP_USER')
             pwd = password or os.environ.get('ALGATOP_PASS')
             if user and pwd:
-                print("Attempting login...")
+                logger.info("Attempting login...")
                 perform_login(driver, user, pwd)
                 time.sleep(2)
                 logged_in = True
-                print("Clicking 'Перейти' button...")
+                logger.info("Clicking 'Перейти' button...")
                 if click_go_button(driver):
                     time.sleep(2)
                 else:
-                    print("Warning: 'Перейти' button not found, continuing anyway...")
+                    logger.warning("'Перейти' button not found, continuing anyway...")
 
         if not logged_in:
-            print("Error: Could not find search field or login. Check credentials/page layout.")
+            logger.error("Could not find search field or login. Check credentials/page layout.")
             return 1
 
-        rows = []
-        successful = 0
-        failed = 0
-        print(f"\nProcessing {len(sku_list)} SKU(s)...\n")
-        for single_sku in sku_list:
-            print(f"Processing SKU: {single_sku}")
-            row = process_single_sku(driver, single_sku, outdir=outdir or OUTPUT_DIR)
-            if row:
-                rows.append(row)
+        successful = sum(1 for r in rows if str(r.get("Status", "")) == "success")
+        failed = sum(1 for r in rows if str(r.get("Status", "")) == "error")
+
+        logger.info(f"Starting processing of {len(pending_skus)} remaining SKU(s)...")
+        newly_processed = 0
+
+        for index, single_sku in enumerate(pending_skus, start=1):
+            logger.info(f"Processing SKU {index}/{len(pending_skus)}: {single_sku}")
+            row = process_single_sku(driver, single_sku, logger, outdir=outdir)
+            rows.append(row)
+
+            if row.get("Status") == "success":
                 successful += 1
             else:
                 failed += 1
+
+            newly_processed += 1
+
+            if newly_processed % CHECKPOINT_EVERY == 0:
+                checkpoint_file = save_checkpoint(rows, outdir=outdir)
+                logger.info(f"Checkpoint saved after {newly_processed} new SKU(s): {checkpoint_file}")
+
             time.sleep(1)
 
-        if rows:
-            output_file = save_results_to_excel(rows, outdir=outdir or OUTPUT_DIR)
-            print(f"\nSaved combined results to {output_file}")
-        else:
-            print("\nNo rows were extracted. No output file created.")
+        checkpoint_file = save_checkpoint(rows, outdir=outdir)
+        logger.info(f"Final checkpoint saved: {checkpoint_file}")
 
-        print(f"\n✓ Completed: {successful} successful, {failed} failed out of {len(sku_list)}")
+        output_file = save_results_to_excel(rows, outdir=outdir)
+        logger.info(f"Saved final results to {output_file}")
+        logger.info(f"Completed: {successful} successful, {failed} failed, total stored rows: {len(rows)}")
         return 0 if successful > 0 else 1
     finally:
         driver.quit()
@@ -914,14 +866,25 @@ def main(sku=None, url=URL, headless=False, outdir=None, username=None, password
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='NTIN Scraper: Automate SKU search and data extraction')
-    parser.add_argument('sku', nargs='?', default=None, help='Optional single SKU to process (if not provided, uses SKU_LIST from config)')
+    parser.add_argument('sku', nargs='?', default=None, help='Optional single SKU to process')
     parser.add_argument('--headless', action='store_true')
-    parser.add_argument('--outdir', default=None, help='Output directory for Excel')
+    parser.add_argument('--outdir', default=None, help='Output directory for Excel/log files')
     parser.add_argument('--url', default=None, help='Override target URL')
     parser.add_argument('--username', default=None, help='Login username/email (or set ALGATOP_USER env)')
     parser.add_argument('--password', default=None, help='Login password (or set ALGATOP_PASS env)')
+    parser.add_argument('--input', default=INPUT_FILE_NAME, help='Input Excel file with SKU values')
+    parser.add_argument('--sku-column', default=INPUT_SKU_COLUMN, help='Column name containing SKU values')
     args = parser.parse_args()
     if args.url:
         URL = args.url
-    rc = main(sku=args.sku, url=URL, headless=args.headless, outdir=args.outdir, username=args.username, password=args.password)
+    rc = main(
+        sku=args.sku,
+        url=URL,
+        headless=args.headless,
+        outdir=args.outdir,
+        username=args.username,
+        password=args.password,
+        input_file=args.input,
+        sku_column=args.sku_column,
+    )
     sys.exit(rc)
