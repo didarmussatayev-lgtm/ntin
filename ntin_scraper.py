@@ -141,15 +141,13 @@ def get_driver(headless=False):
     options.add_argument("--window-size=1400,1000")
     options.add_argument(f"--user-data-dir={CHROME_USER_DATA_DIR}")
     options.add_argument(f"--profile-directory={CHROME_PROFILE_DIRECTORY}")
-    options.add_experimental_option("excludeSwitches", ["enable-automation"])
-    options.add_experimental_option("useAutomationExtension", False)
+    options.add_argument("--no-first-run")
+    options.add_argument("--no-default-browser-check")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--remote-debugging-port=9222")
 
-    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
-    try:
-        driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-    except Exception:
-        pass
-    return driver
+    service = Service(ChromeDriverManager().install())
+    return webdriver.Chrome(service=service, options=options)
 
 
 def load_skus_from_excel(input_file, sku_column=INPUT_SKU_COLUMN, sheet_name=INPUT_SHEET_NAME):
