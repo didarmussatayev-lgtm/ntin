@@ -4,13 +4,12 @@ Usage:
   python ntin_scraper.py [--outdir=path] [--input=ACTIVE.xlsx]
 
 This script opens Chrome, lets the operator manually prepare the session,
-then processes SKU values from an Excel file, extracts modal fields, and
-periodically saves progress so the run can be resumed after failure.
+then processes SKU values from an Excel file, extracts modal fields, retries
+failed items, and periodically saves progress so the run can be resumed after failure.
 """
 import time
 import re
 import sys
-import os
 import logging
 from pathlib import Path
 import argparse
@@ -37,11 +36,12 @@ INPUT_SHEET_NAME = "offer"
 INPUT_SKU_COLUMN = "sku"
 OUTPUT_FILE_NAME = "output.xlsx"
 PROGRESS_FILE_NAME = "progress.xlsx"
+FAILED_FILE_NAME = "failed.xlsx"
 LOG_FILE_NAME = "scraper.log"
 CHECKPOINT_EVERY = 100
+MAX_RETRIES_PER_SKU = 3
 OUTPUT_DIR = Path.cwd()
 WAIT_TIMEOUT = 20
-CHROME_DEBUG_PORT = 9222
 SEARCH_XPATH = "//*[@id=':r5:']"
 SEARCH_CANDIDATES = [
     "//*[@id=':r5:']",
@@ -52,7 +52,6 @@ SEARCH_CANDIDATES = [
     "//input[@role='combobox']",
 ]
 CREATE_BUTTON_XPATH = "//*[@id='root']/div/div[3]/div/div[2]/div[2]/div[4]/div[2]/table/tbody/tr[1]/td[5]/div/span/button"
-GO_BUTTON_XPATH = "//button[contains(., 'Перейти')]"
 MODAL_FALLBACK_XPATH = "//div[@role='dialog'] | //div[contains(@class,'modal')] | //div[contains(@class,'MuiDialog-root')]"
 TABLE_COLUMNS = [
     "SKU",
@@ -71,6 +70,7 @@ TABLE_COLUMNS = [
     "Raw Text",
     "Status",
     "Error",
+    "Attempts",
 ]
 REQUIRED_FIELDS = [
     "Полное наименование товара (рус)",
@@ -137,7 +137,7 @@ def load_skus_from_excel(input_file, sku_column=INPUT_SKU_COLUMN, sheet_name=INP
         raise ValueError(f"Column '{sku_column}' not found in {input_file}. Found columns: {list(df.columns)}")
     series = df[target_col].dropna().astype(str).map(str.strip)
     series = series[series != ""]
-    return series.tolist()
+    return list(dict.fromkeys(series.tolist()))
 
 
 def load_existing_progress(progress_file):
@@ -154,16 +154,24 @@ def load_existing_progress(progress_file):
         return pd.DataFrame(columns=TABLE_COLUMNS)
 
 
-def get_processed_skus(progress_df, only_success=True):
-    if progress_df.empty or "SKU" not in progress_df.columns:
-        return set()
-    working = progress_df.copy()
-    if only_success and "Status" in working.columns:
-        working = working[working["Status"].astype(str) == "success"]
-    return set(working["SKU"].dropna().astype(str).str.strip())
+def get_latest_rows_by_sku(rows):
+    latest = {}
+    for row in rows:
+        sku = str(row.get("SKU", "")).strip()
+        if sku:
+            latest[sku] = row
+    return latest
 
 
-def save_checkpoint(rows, outdir=OUTPUT_DIR, filename=PROGRESS_FILE_NAME):
+def rows_from_latest_map(latest_map):
+    return list(latest_map.values())
+
+
+def get_processed_skus_from_latest(latest_map):
+    return {sku for sku, row in latest_map.items() if str(row.get("Status", "")) == "success"}
+
+
+def save_rows_to_excel(rows, outdir, filename):
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
     out_file = outdir / filename
@@ -171,21 +179,36 @@ def save_checkpoint(rows, outdir=OUTPUT_DIR, filename=PROGRESS_FILE_NAME):
     return out_file
 
 
-def save_results_to_excel(rows, outdir=OUTPUT_DIR, filename=OUTPUT_FILE_NAME):
-    outdir = Path(outdir)
-    outdir.mkdir(parents=True, exist_ok=True)
-    out_file = outdir / filename
-    pd.DataFrame(rows, columns=TABLE_COLUMNS).to_excel(out_file, index=False)
-    return out_file
+def save_checkpoint(rows, outdir=OUTPUT_DIR):
+    return save_rows_to_excel(rows, outdir, PROGRESS_FILE_NAME)
 
 
-def wait_for_manual_ready(driver, logger):
+def save_results_to_excel(rows, outdir=OUTPUT_DIR):
+    return save_rows_to_excel(rows, outdir, OUTPUT_FILE_NAME)
+
+
+def save_failed_to_excel(rows, outdir=OUTPUT_DIR):
+    failed_rows = [row for row in rows if str(row.get("Status", "")) != "success"]
+    return save_rows_to_excel(failed_rows, outdir, FAILED_FILE_NAME)
+
+
+def wait_for_manual_ready(driver, logger, url):
     alert_operator(
         "Chrome is open. Manually open the target site, log in, pass captcha, reach the working page with the search field, then press Enter here.",
         logger,
     )
+    logger.info(f"Target URL: {url}")
     input("After you manually prepare the browser and see the search field, press Enter to continue...")
     return True
+
+
+def create_driver_with_manual_ready(logger, url, headless=False):
+    driver = get_driver(headless=headless)
+    logger.info("Chrome opened by Selenium.")
+    driver.get("about:blank")
+    wait_for_manual_ready(driver, logger, url)
+    find_search_input(driver)
+    return driver
 
 
 def clear_search_input(driver):
@@ -223,8 +246,8 @@ def find_search_input(driver):
 def click_create_button(driver):
     candidates = [
         CREATE_BUTTON_XPATH,
-        "//button[contains(., 'Создать заявку') or contains(., 'Создать')]",
-        "//span[contains(., 'Создать заявку')]/ancestor::button",
+        "//button[contains(., 'Создать заявку') or contains(., 'С��здать')]",
+        "//span[contains(., 'Созд��ть заявку')]/ancestor::button",
     ]
     last_exc = None
     for xp in candidates:
@@ -236,6 +259,34 @@ def click_create_button(driver):
             last_exc = e
             continue
     raise last_exc
+
+
+def close_modal_cancel(driver, wait_timeout=5):
+    candidates = [
+        "//button[contains(., 'Отмена') or contains(., 'Отмен')]",
+        "//button[@aria-label='close' or @aria-label='Close']",
+        "//div[contains(@class,'MuiDialog-root')]//button[contains(., 'Отмена') or contains(@class,'cancel')]",
+    ]
+    for xp in candidates:
+        try:
+            btn = WebDriverWait(driver, wait_timeout).until(EC.element_to_be_clickable((By.XPATH, xp)))
+            try:
+                btn.click()
+                time.sleep(0.5)
+                return True
+            except Exception:
+                driver.execute_script("arguments[0].click();", btn)
+                time.sleep(0.5)
+                return True
+        except Exception:
+            continue
+    try:
+        body = driver.find_element(By.TAG_NAME, 'body')
+        body.send_keys(Keys.ESCAPE)
+        time.sleep(0.5)
+        return True
+    except Exception:
+        return False
 
 
 def get_modal_container(driver):
@@ -360,39 +411,63 @@ def wait_for_modal_ready(driver, timeout=30):
     return wait.until(modal_is_ready)
 
 
-def process_single_sku(driver, sku, logger, outdir=OUTPUT_DIR):
+def make_failed_row(sku, error_message, attempts=0, status="error"):
+    row = {col: "" for col in TABLE_COLUMNS}
+    row["SKU"] = sku
+    row["Status"] = status
+    row["Error"] = str(error_message)
+    row["Attempts"] = attempts
+    return row
+
+
+def process_single_sku_once(driver, sku, logger):
+    clear_search_input(driver)
+    search = find_search_input(driver)
     try:
-        clear_search_input(driver)
-        search = find_search_input(driver)
-        try:
-            search.clear()
-        except Exception:
-            pass
-        search.send_keys(sku)
-        time.sleep(2)
-        try:
-            search.send_keys(Keys.ENTER)
-        except Exception:
-            pass
-        click_create_button(driver)
-        wait_for_modal_ready(driver, timeout=30)
-        row = extract_fields_from_modal(driver)
-        row["SKU"] = sku
-        row["Status"] = "success"
-        row["Error"] = ""
-        logger.info(f"[SKU: {sku}] Extracted successfully")
-        try:
-            close_modal_cancel(driver)
-        except Exception as e:
-            logger.warning(f"[SKU: {sku}] Error while closing modal: {e}")
-        return row
+        search.clear()
+    except Exception:
+        pass
+    search.send_keys(sku)
+    time.sleep(2)
+    try:
+        search.send_keys(Keys.ENTER)
+    except Exception:
+        pass
+    click_create_button(driver)
+    wait_for_modal_ready(driver, timeout=30)
+    row = extract_fields_from_modal(driver)
+    row["SKU"] = sku
+    row["Status"] = "success"
+    row["Error"] = ""
+    logger.info(f"[SKU: {sku}] Extracted successfully")
+    try:
+        close_modal_cancel(driver)
     except Exception as e:
-        logger.error(f"[SKU: {sku}] Error: {e}")
-        failed_row = {col: "" for col in TABLE_COLUMNS}
-        failed_row["SKU"] = sku
-        failed_row["Status"] = "error"
-        failed_row["Error"] = str(e)
-        return failed_row
+        logger.warning(f"[SKU: {sku}] Error while closing modal: {e}")
+    return row
+
+
+def process_single_sku_with_retries(driver, sku, logger, max_retries=MAX_RETRIES_PER_SKU):
+    last_error = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            logger.info(f"[SKU: {sku}] Attempt {attempt}/{max_retries}")
+            row = process_single_sku_once(driver, sku, logger)
+            row["Attempts"] = attempt
+            return row
+        except (InvalidSessionIdException, WebDriverException):
+            raise
+        except Exception as e:
+            last_error = e
+            logger.error(f"[SKU: {sku}] Attempt {attempt} failed: {e}")
+            if attempt < max_retries:
+                time.sleep(2)
+    return make_failed_row(sku, last_error or "Unknown error", attempts=max_retries, status="error")
+
+
+def restart_browser_session(logger, url, headless=False):
+    alert_operator("Browser session lost. A new browser will open. Prepare the page manually again.", logger)
+    return create_driver_with_manual_ready(logger, url, headless=headless)
 
 
 def main(sku=None, url=URL, headless=False, outdir=None, username=None, password=None, sku_list=None, input_file=None, sku_column=INPUT_SKU_COLUMN):
@@ -400,7 +475,6 @@ def main(sku=None, url=URL, headless=False, outdir=None, username=None, password
     outdir.mkdir(parents=True, exist_ok=True)
     logger = setup_logging(outdir)
     input_path = Path(input_file or INPUT_FILE_NAME)
-    progress_path = outdir / PROGRESS_FILE_NAME
 
     if sku_list is None:
         sku_list = [sku] if sku else load_skus_from_excel(input_path, sku_column=sku_column)
@@ -408,71 +482,80 @@ def main(sku=None, url=URL, headless=False, outdir=None, username=None, password
         logger.error("No SKU provided or found in input file.")
         return 1
 
-    existing_progress = load_existing_progress(progress_path)
-    rows = existing_progress.to_dict("records") if not existing_progress.empty else []
-    processed_skus = get_processed_skus(existing_progress, only_success=True)
+    existing_progress = load_existing_progress(outdir / PROGRESS_FILE_NAME)
+    latest_map = get_latest_rows_by_sku(existing_progress.to_dict("records") if not existing_progress.empty else [])
+    processed_skus = get_processed_skus_from_latest(latest_map)
     pending_skus = [str(x).strip() for x in sku_list if str(x).strip() and str(x).strip() not in processed_skus]
 
-    logger.info(f"Loaded {len(sku_list)} SKU(s) from source")
+    logger.info(f"Loaded {len(sku_list)} unique SKU(s) from source")
     logger.info(f"Already processed successfully: {len(processed_skus)}")
     logger.info(f"Pending: {len(pending_skus)}")
 
     if not pending_skus:
-        final_file = save_results_to_excel(rows, outdir=outdir)
+        current_rows = rows_from_latest_map(latest_map)
+        final_file = save_results_to_excel(current_rows, outdir=outdir)
+        failed_file = save_failed_to_excel(current_rows, outdir=outdir)
         logger.info(f"Nothing to process. Final file is up to date: {final_file}")
+        logger.info(f"Failed file refreshed: {failed_file}")
         return 0
 
     try:
-        driver = get_driver(headless=headless)
+        driver = create_driver_with_manual_ready(logger, url, headless=headless)
     except WebDriverException as e:
         logger.error(f"Could not start Chrome automatically: {e}")
         logger.error("Start Chrome manually, open the target page, log in, pass captcha, then rerun the script.")
         return 1
 
+    successful = sum(1 for row in latest_map.values() if str(row.get("Status", "")) == "success")
+    failed = sum(1 for row in latest_map.values() if str(row.get("Status", "")) != "success")
+    newly_processed = 0
+
     try:
-        logger.info("Chrome opened by Selenium.")
-        logger.info(f"Open this URL manually in the browser if needed: {url}")
-        driver.get("about:blank")
-        wait_for_manual_ready(driver, logger)
-
-        try:
-            find_search_input(driver)
-        except Exception:
-            logger.error("Search field not found after manual preparation. Make sure you are on the working NTIN page.")
-            return 1
-
-        successful = sum(1 for r in rows if str(r.get("Status", "")) == "success")
-        failed = sum(1 for r in rows if str(r.get("Status", "")) == "error")
-        newly_processed = 0
-
-        for index, single_sku in enumerate(pending_skus, start=1):
-            logger.info(f"Processing SKU {index}/{len(pending_skus)}: {single_sku}")
+        index = 0
+        while index < len(pending_skus):
+            single_sku = pending_skus[index]
+            logger.info(f"Processing SKU {index + 1}/{len(pending_skus)}: {single_sku}")
             try:
-                row = process_single_sku(driver, single_sku, logger, outdir=outdir)
+                row = process_single_sku_with_retries(driver, single_sku, logger)
             except (InvalidSessionIdException, WebDriverException) as e:
                 logger.error(f"Browser session was lost while processing SKU {single_sku}: {e}")
-                logger.error("Save progress, reopen browser manually, and rerun the script to continue from remaining successful items.")
-                checkpoint_file = save_checkpoint(rows, outdir=outdir)
+                latest_map[single_sku] = make_failed_row(single_sku, e, attempts=0, status="session_lost")
+                checkpoint_rows = rows_from_latest_map(latest_map)
+                checkpoint_file = save_checkpoint(checkpoint_rows, outdir=outdir)
+                failed_file = save_failed_to_excel(checkpoint_rows, outdir=outdir)
                 logger.info(f"Emergency checkpoint saved: {checkpoint_file}")
-                break
+                logger.info(f"Failed file updated: {failed_file}")
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+                driver = restart_browser_session(logger, url, headless=headless)
+                continue
 
-            rows.append(row)
+            latest_map[single_sku] = row
             if row.get("Status") == "success":
                 successful += 1
             else:
                 failed += 1
             newly_processed += 1
+            index += 1
 
             if newly_processed % CHECKPOINT_EVERY == 0:
-                checkpoint_file = save_checkpoint(rows, outdir=outdir)
+                checkpoint_rows = rows_from_latest_map(latest_map)
+                checkpoint_file = save_checkpoint(checkpoint_rows, outdir=outdir)
+                failed_file = save_failed_to_excel(checkpoint_rows, outdir=outdir)
                 logger.info(f"Checkpoint saved after {newly_processed} new SKU(s): {checkpoint_file}")
+                logger.info(f"Failed file updated: {failed_file}")
             time.sleep(1)
 
-        checkpoint_file = save_checkpoint(rows, outdir=outdir)
-        output_file = save_results_to_excel(rows, outdir=outdir)
+        final_rows = rows_from_latest_map(latest_map)
+        checkpoint_file = save_checkpoint(final_rows, outdir=outdir)
+        output_file = save_results_to_excel(final_rows, outdir=outdir)
+        failed_file = save_failed_to_excel(final_rows, outdir=outdir)
         logger.info(f"Final checkpoint saved: {checkpoint_file}")
         logger.info(f"Saved final results to {output_file}")
-        logger.info(f"Completed: {successful} successful, {failed} failed, total stored rows: {len(rows)}")
+        logger.info(f"Saved failed rows to {failed_file}")
+        logger.info(f"Completed: {successful} successful, {failed} failed, total unique rows stored: {len(final_rows)}")
         return 0 if successful > 0 else 1
     finally:
         try:
@@ -482,7 +565,7 @@ def main(sku=None, url=URL, headless=False, outdir=None, username=None, password
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='NTIN Scraper: Automate SKU search and data extraction')
+    parser = argparse.ArgumentParser(description='NTIN Scraper: manual browser prep + resilient SKU processing')
     parser.add_argument('sku', nargs='?', default=None, help='Optional single SKU to process')
     parser.add_argument('--headless', action='store_true')
     parser.add_argument('--outdir', default=None, help='Output directory for Excel/log files')
@@ -494,5 +577,14 @@ if __name__ == '__main__':
     args = parser.parse_args()
     if args.url:
         URL = args.url
-    rc = main(sku=args.sku, url=URL, headless=args.headless, outdir=args.outdir, username=args.username, password=args.password, input_file=args.input, sku_column=args.sku_column)
+    rc = main(
+        sku=args.sku,
+        url=URL,
+        headless=args.headless,
+        outdir=args.outdir,
+        username=args.username,
+        password=args.password,
+        input_file=args.input,
+        sku_column=args.sku_column,
+    )
     sys.exit(rc)
