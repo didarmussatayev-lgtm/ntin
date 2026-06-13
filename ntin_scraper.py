@@ -476,10 +476,21 @@ def get_field_value_from_modal(modal, labels):
                 try:
                     label_for = label_el.get_attribute("for")
                     if label_for:
-                        linked = modal.find_element(By.ID, label_for)
+                        linked = modal.find_element(By.XPATH, f".//*[@id='{label_for}']")
                         tag = linked.tag_name.lower()
+                        role = (linked.get_attribute("role") or "").lower()
 
                         if tag in ["input", "textarea"]:
+                            value = linked.get_attribute("value")
+                            if value and value.strip():
+                                return value.strip()
+
+                        if tag == "div" and role == "combobox":
+                            text = (linked.text or "").strip()
+                            if text:
+                                return text
+
+                        if tag == "input" and role == "combobox":
                             value = linked.get_attribute("value")
                             if value and value.strip():
                                 return value.strip()
@@ -506,10 +517,34 @@ def get_field_value_from_modal(modal, labels):
                         found = label_el.find_elements(By.XPATH, xp)
                         for el in found:
                             tag = el.tag_name.lower()
+                            role = (el.get_attribute("role") or "").lower()
+
                             if tag in ["input", "textarea"]:
                                 value = el.get_attribute("value")
                                 if value and value.strip():
                                     return value.strip()
+
+                            if tag == "input" and role == "combobox":
+                                value = el.get_attribute("value")
+                                if value and value.strip():
+                                    return value.strip()
+                    except Exception:
+                        continue
+
+                combobox_xpaths = [
+                    "./following-sibling::*//div[@role='combobox'][1]",
+                    "./ancestor::div[1]//div[@role='combobox'][1]",
+                    "./ancestor::div[2]//div[@role='combobox'][1]",
+                    "./parent::*//div[@role='combobox'][1]",
+                ]
+
+                for xp in combobox_xpaths:
+                    try:
+                        found = label_el.find_elements(By.XPATH, xp)
+                        for el in found:
+                            text = (el.text or "").strip()
+                            if text:
+                                return text
                     except Exception:
                         continue
 
@@ -547,6 +582,15 @@ def get_field_value_from_modal(modal, labels):
                                     value = inner.get_attribute("value")
                                     if value and value.strip():
                                         return value.strip()
+                            except Exception:
+                                pass
+
+                            try:
+                                inner_boxes = el.find_elements(By.XPATH, ".//div[@role='combobox']")
+                                for inner in inner_boxes:
+                                    text = (inner.text or "").strip()
+                                    if text:
+                                        return text
                             except Exception:
                                 pass
 
@@ -604,7 +648,7 @@ def extract_fields_from_modal(driver):
     ])
 
     row["Количественное значение"] = get_field_value_from_modal(modal, [
-        "Количество количественное значение",
+        "Количество кол��чественное значение",
         "Количество количественное значение (в [ед. изм.])",
         "Количественное значение",
         "Количество значение",
@@ -639,6 +683,62 @@ def extract_fields_from_modal(driver):
         "Расширенная форма заявки *",
         "Расширенная форма заявки **",
     ])
+
+    if not row["Страна происхождения"] and modal:
+        try:
+            labels = modal.find_elements(By.XPATH, ".//label[contains(., 'Страна происхождения')]")
+            for lbl in labels:
+                label_for = lbl.get_attribute("for")
+                if label_for:
+                    el = modal.find_element(By.XPATH, f".//*[@id='{label_for}']")
+                    text = (el.text or "").strip()
+                    if text:
+                        row["Страна происхождения"] = text
+                        break
+        except Exception:
+            pass
+
+    if not row["Единица измерения"] and modal:
+        try:
+            labels = modal.find_elements(By.XPATH, ".//label[contains(., 'Единица измерения')]")
+            for lbl in labels:
+                label_for = lbl.get_attribute("for")
+                if label_for:
+                    el = modal.find_element(By.XPATH, f".//*[@id='{label_for}']")
+                    text = (el.text or "").strip()
+                    if text:
+                        row["Единица измерения"] = text
+                        break
+        except Exception:
+            pass
+
+    if not row["Количественное значение"] and modal:
+        try:
+            labels = modal.find_elements(By.XPATH, ".//label[contains(., 'Количественное значение') or contains(., 'Количество количественное значение')]")
+            for lbl in labels:
+                label_for = lbl.get_attribute("for")
+                if label_for:
+                    el = modal.find_element(By.XPATH, f".//*[@id='{label_for}']")
+                    value = el.get_attribute("value")
+                    if value and value.strip():
+                        row["Количественное значение"] = value.strip()
+                        break
+        except Exception:
+            pass
+
+    if not row["ТНВЭД ЕАЭС"] and modal:
+        try:
+            labels = modal.find_elements(By.XPATH, ".//label[contains(., 'ТНВЭД ЕАЭС')]")
+            for lbl in labels:
+                label_for = lbl.get_attribute("for")
+                if label_for:
+                    el = modal.find_element(By.XPATH, f".//*[@id='{label_for}']")
+                    value = el.get_attribute("value")
+                    if value and value.strip():
+                        row["ТНВЭД ЕАЭС"] = value.strip()
+                        break
+        except Exception:
+            pass
 
     return row
 
