@@ -415,6 +415,58 @@ def get_modal_container(driver):
         return None
 
 
+def wait_for_modal_ready(driver, timeout=20):
+    """Wait until the modal is visible and key fields are populated."""
+    wait = WebDriverWait(driver, timeout)
+
+    wait.until(EC.visibility_of_element_located((By.XPATH, MODAL_FALLBACK_XPATH)))
+
+    def modal_is_ready(_driver):
+        try:
+            modal = get_modal_container(_driver)
+            if modal is None or not modal.is_displayed():
+                return False
+
+            text = (modal.text or "").strip()
+            if re.search(r'\d{4}-\d{4}-\d{4}-\d+', text):
+                return modal
+
+            candidate_xpaths = [
+                ".//input[string-length(@value) > 0]",
+                ".//textarea[string-length(@value) > 0]",
+                ".//div[@role='combobox' and string-length(normalize-space()) > 0]",
+                ".//input[@role='combobox' and string-length(@value) > 0]",
+                ".//input[@type='number' and string-length(@value) > 0]",
+            ]
+
+            for xp in candidate_xpaths:
+                try:
+                    elems = modal.find_elements(By.XPATH, xp)
+                    if elems:
+                        return modal
+                except Exception:
+                    continue
+
+            labels_to_check = [
+                "Полное наименование товара (рус)",
+                "Страна происхождения",
+                "Единица измерения",
+                "ТНВЭД ЕАЭС",
+                "Наименование производителя",
+            ]
+
+            for label in labels_to_check:
+                value = get_field_value_from_modal(modal, [label])
+                if value and value.strip():
+                    return modal
+
+            return False
+        except Exception:
+            return False
+
+    return wait.until(modal_is_ready)
+
+
 def extract_ntin_code(modal):
     if modal is None:
         return ""
@@ -648,7 +700,7 @@ def extract_fields_from_modal(driver):
     ])
 
     row["Количественное значение"] = get_field_value_from_modal(modal, [
-        "Количество кол��чественное значение",
+        "Количество количественное значение",
         "Количество количественное значение (в [ед. изм.])",
         "Количественное значение",
         "Количество значение",
@@ -740,6 +792,20 @@ def extract_fields_from_modal(driver):
         except Exception:
             pass
 
+    if not row["Наименование производителя"] and modal:
+        try:
+            labels = modal.find_elements(By.XPATH, ".//label[contains(., 'Наименование производителя')]")
+            for lbl in labels:
+                label_for = lbl.get_attribute("for")
+                if label_for:
+                    el = modal.find_element(By.XPATH, f".//*[@id='{label_for}']")
+                    value = el.get_attribute("value")
+                    if value and value.strip():
+                        row["Наименование производителя"] = value.strip()
+                        break
+        except Exception:
+            pass
+
     return row
 
 
@@ -764,7 +830,7 @@ def process_single_sku(driver, sku, outdir=OUTPUT_DIR):
             pass
 
         click_create_button(driver)
-        time.sleep(7)
+        wait_for_modal_ready(driver, timeout=25)
 
         row = extract_fields_from_modal(driver)
         row["SKU"] = sku
