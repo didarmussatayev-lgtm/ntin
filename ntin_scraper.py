@@ -92,8 +92,6 @@ def perform_login(driver, username, password, wait_timeout=20):
     """Try several common selectors to locate login form, fill credentials and submit.
     Returns True if login action likely performed, False otherwise.
     """
-    wait = WebDriverWait(driver, wait_timeout)
-    # try common email/username selectors
     email_selectors = [
         (By.NAME, 'email'),
         (By.NAME, 'username'),
@@ -124,7 +122,6 @@ def perform_login(driver, username, password, wait_timeout=20):
             continue
 
     if not email_el or not pass_el:
-        # Could not find form
         return False
 
     try:
@@ -133,17 +130,14 @@ def perform_login(driver, username, password, wait_timeout=20):
         pass_el.clear()
         pass_el.send_keys(password)
     except Exception:
-        # if sending fails, still return False
         return False
 
-    # try to find submit button near password element
     try:
         btn = pass_el.find_element(By.XPATH, "ancestor::form//button[@type='submit']")
     except Exception:
         btn = None
 
     if not btn:
-        # generic buttons with text
         try:
             btn = driver.find_element(By.XPATH, "//button[contains(., 'Войти') or contains(., 'Вход') or contains(., 'Login') or contains(., 'Sign in')]")
         except Exception:
@@ -153,17 +147,14 @@ def perform_login(driver, username, password, wait_timeout=20):
         if btn:
             btn.click()
         else:
-            # submit form via Enter key
             pass_el.send_keys(Keys.ENTER)
     except Exception:
         pass
 
-    # wait briefly for page to change / for search input to appear
     try:
         WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.XPATH, SEARCH_XPATH)))
         return True
     except Exception:
-        # fallback: assume login attempted
         return True
 
 
@@ -183,7 +174,6 @@ def click_go_button(driver, wait_timeout=20):
 
 def close_modal_cancel(driver, wait_timeout=5):
     """Close the open modal by clicking 'Отмена' button, or the close icon, or sending ESC."""
-    # Try button with text 'Отмена'
     candidates = [
         "//button[contains(., 'Отмена') or contains(., 'Отмен')]",
         "//button[@aria-label='close' or @aria-label='Close']",
@@ -199,14 +189,12 @@ def close_modal_cancel(driver, wait_timeout=5):
                 time.sleep(0.5)
                 return True
             except Exception:
-                # try JS click as fallback
                 driver.execute_script("arguments[0].click();", btn)
                 time.sleep(0.5)
                 return True
         except Exception:
             continue
 
-    # Try clicking the top-right close icon (×)
     try:
         close_x = driver.find_element(By.XPATH, "//button[contains(@aria-label,'close') or contains(., '×') or contains(., '✖')]")
         try:
@@ -220,7 +208,6 @@ def close_modal_cancel(driver, wait_timeout=5):
     except Exception:
         pass
 
-    # Fallback: send ESC key
     try:
         body = driver.find_element(By.TAG_NAME, 'body')
         body.send_keys(Keys.ESCAPE)
@@ -240,14 +227,12 @@ def clear_search_input(driver, wait_timeout=3):
     except Exception:
         return True
 
-    # Try standard clear()
     try:
         el.clear()
         time.sleep(0.15)
     except Exception:
         pass
 
-    # Try select-all + delete (Ctrl+A / Command+A)
     try:
         el.send_keys(Keys.CONTROL, 'a')
         el.send_keys(Keys.DELETE)
@@ -260,14 +245,12 @@ def clear_search_input(driver, wait_timeout=3):
         except Exception:
             pass
 
-    # Force empty value via JS and dispatch input event
     try:
         driver.execute_script("arguments[0].value = ''; arguments[0].dispatchEvent(new Event('input'));", el)
         time.sleep(0.15)
     except Exception:
         pass
 
-    # Verify empty
     try:
         val = el.get_attribute('value') or el.get_attribute('text') or ''
         if val.strip() == '':
@@ -275,7 +258,6 @@ def clear_search_input(driver, wait_timeout=3):
     except Exception:
         pass
 
-    # If component uses token chips, try removing them by clicking remove icons
     token_xpaths = [
         "//div[contains(@class,'MuiChip-root')]//button",
         "//button[contains(@class,'chip-remove') or contains(@aria-label,'remove') or contains(@aria-label,'Удалить')]",
@@ -301,7 +283,6 @@ def clear_search_input(driver, wait_timeout=3):
             continue
 
     if removed_any:
-        # final verification
         try:
             el = find_search_input(driver)
             val = el.get_attribute('value') or ''
@@ -309,7 +290,6 @@ def clear_search_input(driver, wait_timeout=3):
         except Exception:
             return True
 
-    # Last resort: focus and send multiple backspaces
     try:
         el.click()
         for _ in range(10):
@@ -322,25 +302,21 @@ def clear_search_input(driver, wait_timeout=3):
 
 
 def find_search_input(driver):
-    # Try multiple candidate selectors and return the first visible, enabled input
     for xpath in SEARCH_CANDIDATES:
         try:
             el = WebDriverWait(driver, 3).until(
                 EC.presence_of_element_located((By.XPATH, xpath))
             )
-            # Ensure element is visible and enabled
             if el.is_displayed() and el.is_enabled():
                 return el
         except Exception:
             continue
-    # fallback to original single-wait which may raise
     return WebDriverWait(driver, WAIT_TIMEOUT).until(
         EC.presence_of_element_located((By.XPATH, SEARCH_XPATH))
     )
 
 
 def click_create_button(driver):
-    # Try primary create button xpath first, then fallback to buttons containing expected text
     candidates = [
         CREATE_BUTTON_XPATH,
         "//button[contains(., 'Создать заявку') or contains(., 'Создать')]",
@@ -357,17 +333,14 @@ def click_create_button(driver):
         except Exception as e:
             last_exc = e
             continue
-    # If none worked, raise the last exception for upstream logging
     raise last_exc
 
 
 def find_modal_text(driver):
-    # Try to locate modal by title text
     try:
         title_el = WebDriverWait(driver, 10).until(
             EC.presence_of_element_located((By.XPATH, f"//*[contains(text(), '{MODAL_TITLE_TEXT}')]") )
         )
-        # get nearest ancestor dialog/modal container
         ancestor = title_el.find_element(By.XPATH, "ancestor::div[@role='dialog'] | ancestor::div[contains(@class,'modal')] | ancestor::div[contains(@class,'MuiDialog-root')] | ..")
         text = ancestor.text
         if text.strip():
@@ -375,7 +348,6 @@ def find_modal_text(driver):
     except Exception:
         pass
 
-    # fallback: any dialog-like container
     try:
         modal = WebDriverWait(driver, 10).until(
             EC.presence_of_element_located((By.XPATH, MODAL_FALLBACK_XPATH))
@@ -385,17 +357,14 @@ def find_modal_text(driver):
     except Exception:
         pass
 
-    # final fallback: page source text (rare)
     return driver.page_source
 
 
 def extract_from_1103(text):
-    # Find the first occurrence of a token that begins with 1103-
     m = re.search(r'(1103[-\d]+)', text)
     if m:
         return m.group(1)
 
-    # If not found, search by lines for a line starting with 1103-
     lines = text.splitlines()
     for line in lines:
         stripped = line.strip()
@@ -418,11 +387,9 @@ def save_results_to_excel(rows, outdir=OUTPUT_DIR, filename=OUTPUT_FILE_NAME):
 def get_next_value(lines, index):
     if index < len(lines):
         line = lines[index]
-        # If label and value are on same line separated by colon, dash, or double space
         parts = re.split(r"\s*[:\-]\s*", line, maxsplit=1)
         if len(parts) == 2 and parts[0].strip() != line.strip():
             return parts[1].strip()
-        # Otherwise return next line if present
         if index + 1 < len(lines):
             return lines[index + 1].strip()
     return ""
@@ -448,123 +415,230 @@ def get_modal_container(driver):
         return None
 
 
+def extract_ntin_code(modal):
+    if modal is None:
+        return ""
+
+    patterns = [
+        r'(\d{4}-\d{4}-\d{4}-\d+)',
+        r'(1103[-\d]+)',
+        r'(1070[-\d]+)',
+        r'(8504[-\d]+)',
+    ]
+
+    try:
+        text = modal.text or ""
+        for pattern in patterns:
+            m = re.search(pattern, text)
+            if m:
+                return m.group(1)
+    except Exception:
+        pass
+
+    try:
+        elems = modal.find_elements(By.XPATH, ".//*[self::span or self::div or self::p or self::label]")
+        for el in elems:
+            try:
+                txt = (el.text or "").strip()
+                if not txt:
+                    continue
+                for pattern in patterns:
+                    m = re.search(pattern, txt)
+                    if m:
+                        return m.group(1)
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    return ""
+
+
 def get_field_value_from_modal(modal, labels):
+    if modal is None:
+        return ""
+
     for label in labels:
-        try:
-            label_el = modal.find_element(
-                By.XPATH,
-                ".//*[normalize-space(text())='%s' or contains(normalize-space(.), '%s')]" % (label, label)
-            )
-        except Exception:
-            continue
-
-        # search nearest input/select/textarea within the same group
-        searches = [
-            ".//following::input[1]",
-            ".//following::textarea[1]",
-            ".//following::div[contains(@class,'MuiSelect-root')][1]",
-            ".//following::div[contains(@class,'Select')][1]",
-            ".//ancestor::div[1]//input[1]",
-            ".//ancestor::div[1]//textarea[1]",
+        label_xpaths = [
+            f".//label[normalize-space()='{label}']",
+            f".//label[contains(normalize-space(), '{label}')]",
+            f".//*[self::span or self::div or self::p][normalize-space()='{label}']",
+            f".//*[self::span or self::div or self::p][contains(normalize-space(), '{label}')]",
         ]
-        for xp in searches:
+
+        for label_xpath in label_xpaths:
             try:
-                el = label_el.find_element(By.XPATH, xp)
-            except Exception:
-                continue
-            try:
-                if el.tag_name.lower() in ['input', 'textarea']:
-                    value = el.get_attribute('value')
-                    if value and value.strip():
-                        return value.strip()
-                else:
-                    value = el.text
-                    if value and value.strip():
-                        return value.strip()
+                label_elements = modal.find_elements(By.XPATH, label_xpath)
             except Exception:
                 continue
 
-        # if nothing found, maybe label itself contains the value on same line
-        text = label_el.text.strip()
-        if label in text:
-            candidate = text.replace(label, '').strip(' :–-')
-            if candidate:
-                return candidate
+            for label_el in label_elements:
+                try:
+                    label_for = label_el.get_attribute("for")
+                    if label_for:
+                        linked = modal.find_element(By.ID, label_for)
+                        tag = linked.tag_name.lower()
+
+                        if tag in ["input", "textarea"]:
+                            value = linked.get_attribute("value")
+                            if value and value.strip():
+                                return value.strip()
+
+                        text = (linked.text or "").strip()
+                        if text:
+                            return text
+                except Exception:
+                    pass
+
+                near_input_xpaths = [
+                    "./following-sibling::*//input[1]",
+                    "./following-sibling::*//textarea[1]",
+                    "./ancestor::div[1]//input[1]",
+                    "./ancestor::div[1]//textarea[1]",
+                    "./ancestor::div[2]//input[1]",
+                    "./ancestor::div[2]//textarea[1]",
+                    "./parent::*//input[1]",
+                    "./parent::*//textarea[1]",
+                ]
+
+                for xp in near_input_xpaths:
+                    try:
+                        found = label_el.find_elements(By.XPATH, xp)
+                        for el in found:
+                            tag = el.tag_name.lower()
+                            if tag in ["input", "textarea"]:
+                                value = el.get_attribute("value")
+                                if value and value.strip():
+                                    return value.strip()
+                    except Exception:
+                        continue
+
+                near_select_xpaths = [
+                    "./following-sibling::*//*[contains(@class,'MuiSelect')][1]",
+                    "./ancestor::div[1]//*[contains(@class,'MuiSelect')][1]",
+                    "./ancestor::div[2]//*[contains(@class,'MuiSelect')][1]",
+                    "./parent::*//*[contains(@class,'MuiSelect')][1]",
+                ]
+
+                for xp in near_select_xpaths:
+                    try:
+                        found = label_el.find_elements(By.XPATH, xp)
+                        for el in found:
+                            text = (el.text or "").strip()
+                            if text:
+                                return text
+                    except Exception:
+                        continue
+
+                text_xpaths = [
+                    "./following-sibling::*[1]",
+                    "./parent::*",
+                    "./ancestor::div[1]",
+                    "./ancestor::div[2]",
+                ]
+
+                for xp in text_xpaths:
+                    try:
+                        found = label_el.find_elements(By.XPATH, xp)
+                        for el in found:
+                            try:
+                                inner_inputs = el.find_elements(By.XPATH, ".//input | .//textarea")
+                                for inner in inner_inputs:
+                                    value = inner.get_attribute("value")
+                                    if value and value.strip():
+                                        return value.strip()
+                            except Exception:
+                                pass
+
+                            txt = (el.text or "").strip()
+                            if txt and txt != label and label not in txt:
+                                return txt
+                    except Exception:
+                        continue
+
     return ""
 
 
 def extract_fields_from_modal(driver):
     modal = get_modal_container(driver)
-    text = ''
+    text = ""
     if modal:
         try:
             text = modal.text
         except Exception:
-            text = ''
+            text = ""
 
     row = {col: "" for col in TABLE_COLUMNS}
     row["Raw Text"] = text.strip()
 
-    row["NTIN_CODE"] = extract_from_1103(text) or ""
+    row["NTIN_CODE"] = extract_ntin_code(modal)
+
     row["Полное наименование товара (рус)"] = get_field_value_from_modal(modal, [
         "Полное наименование товара (рус)",
-        "Полное наименование товара (рус) **",
         "Полное наименование товара (рус) *",
+        "Полное наименование товара (рус) **",
     ])
+
     row["Полное наименование товара (каз)"] = get_field_value_from_modal(modal, [
         "Полное наименование товара (каз)",
-        "Полное наименование товара (каз) **",
         "Полное наименование товара (каз) *",
+        "Полное наименование товара (каз) **",
     ])
+
     row["Краткое наименование товара (рус)"] = get_field_value_from_modal(modal, [
         "Краткое наименование товара (рус)",
-        "Краткое наименование товара (рус) **",
         "Краткое наименование товара (рус) *",
+        "Краткое наименование товара (рус) **",
     ])
+
     row["Страна происхождения"] = get_field_value_from_modal(modal, [
         "Страна происхождения",
+        "Страна происхождения *",
         "Страна происхождения **",
     ])
+
     row["Единица измерения"] = get_field_value_from_modal(modal, [
         "Единица измерения",
+        "Единица измерения *",
         "Единица измерения **",
     ])
+
     row["Количественное значение"] = get_field_value_from_modal(modal, [
         "Количество количественное значение",
         "Количество количественное значение (в [ед. изм.])",
         "Количественное значение",
         "Количество значение",
     ])
+
     row["ТНВЭД ЕАЭС"] = get_field_value_from_modal(modal, [
         "ТНВЭД ЕАЭС",
+        "ТНВЭД ЕАЭС *",
         "ТНВЭД ЕАЭС **",
     ])
+
     row["Наименование производителя"] = get_field_value_from_modal(modal, [
         "Наименование производителя",
         "Наименование производителя *",
+        "Наименование производителя **",
     ])
+
     row["Категория ОКТРУ (НКТ)"] = get_field_value_from_modal(modal, [
         "Категория ОКТРУ (НКТ)",
+        "Категория ОКТРУ (НКТ) *",
         "Категория ОКТРУ (НКТ) **",
     ])
+
     row["Подобрано AI"] = get_field_value_from_modal(modal, [
         "Подобрано AI",
         "Подобрано AI *",
+        "Подобрано AI **",
     ])
+
     row["Расширенная форма заявки"] = get_field_value_from_modal(modal, [
         "Расширенная форма заявки",
         "Расширенная форма заявки *",
+        "Расширенная форма заявки **",
     ])
-
-    # if NTIN code not found in text, try to extract from modal DOM directly
-    if not row["NTIN_CODE"] and modal:
-        try:
-            candidate = modal.find_element(By.XPATH, ".//*[contains(text(), '1103-') or contains(text(), '1070-') or contains(text(), '8504-')]")
-            code_match = re.search(r'(1103[-\d]+|1070[-\d]+|8504[-\d]+)', candidate.text)
-            if code_match:
-                row["NTIN_CODE"] = code_match.group(1)
-        except Exception:
-            pass
 
     return row
 
@@ -572,39 +646,30 @@ def extract_fields_from_modal(driver):
 def process_single_sku(driver, sku, outdir=OUTPUT_DIR):
     """Process a single SKU: input it, click button, extract data, return row dict."""
     try:
-        # ensure previous search value/tokens removed before typing next SKU
         try:
             clear_search_input(driver)
         except Exception:
             pass
 
         search = find_search_input(driver)
-        # input sku
         try:
             search.clear()
         except Exception:
             pass
         search.send_keys(sku)
-        # wait 2 seconds as requested
         time.sleep(2)
-        # optionally press Enter to trigger search
         try:
             search.send_keys(Keys.ENTER)
         except Exception:
             pass
 
-        # click create
         click_create_button(driver)
-
-        # wait 7 seconds for modal content to load
         time.sleep(7)
 
         row = extract_fields_from_modal(driver)
         row["SKU"] = sku
 
-        out_file = None
         print(f"  [SKU: {sku}] Extracted row values")
-        # close modal so next SKU can be processed cleanly
         try:
             closed = close_modal_cancel(driver)
             if not closed:
@@ -619,13 +684,10 @@ def process_single_sku(driver, sku, outdir=OUTPUT_DIR):
 
 def main(sku=None, url=URL, headless=False, outdir=None, username=None, password=None, sku_list=None):
     """Main function: login once, click 'Перейти', then process all SKUs from sku_list."""
-    # Use provided sku_list or global SKU_LIST, or single sku if provided
     if sku_list is None:
         if sku:
-            # Single SKU provided via CLI
             sku_list = [sku]
         else:
-            # Use global SKU_LIST from config
             sku_list = SKU_LIST
 
     if not sku_list:
@@ -636,22 +698,18 @@ def main(sku=None, url=URL, headless=False, outdir=None, username=None, password
     try:
         driver.get(url)
 
-        # Try to find search input; if not present, attempt login (if credentials provided)
         logged_in = False
         try:
             find_search_input(driver)
             logged_in = True
         except Exception:
-            # attempt login with provided credentials or environment vars
             user = username or os.environ.get('ALGATOP_USER')
             pwd = password or os.environ.get('ALGATOP_PASS')
             if user and pwd:
                 print("Attempting login...")
                 perform_login(driver, user, pwd)
-                # small wait for redirect
                 time.sleep(2)
                 logged_in = True
-                # Click "Перейти" button after successful login
                 print("Clicking 'Перейти' button...")
                 if click_go_button(driver):
                     time.sleep(2)
@@ -662,7 +720,6 @@ def main(sku=None, url=URL, headless=False, outdir=None, username=None, password
             print("Error: Could not find search field or login. Check credentials/page layout.")
             return 1
 
-        # Process each SKU and collect rows for a single output file
         rows = []
         successful = 0
         failed = 0
@@ -675,7 +732,7 @@ def main(sku=None, url=URL, headless=False, outdir=None, username=None, password
                 successful += 1
             else:
                 failed += 1
-            time.sleep(1)  # small delay between SKUs
+            time.sleep(1)
 
         if rows:
             output_file = save_results_to_excel(rows, outdir=outdir or OUTPUT_DIR)
